@@ -2,6 +2,8 @@
 
 A terminal client for Claude.ai that lets you chat with Claude directly from your command line.
 
+![gogpt](assets/gogpt.png)
+
 ## Features
 
 - **Interactive chat** — Full conversation support with streaming responses
