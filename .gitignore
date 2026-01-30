@@ -1,0 +1,44 @@
+# Dependencies
+vendor/
+
+# Build outputs
+gogpt
+gogpt.exe
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Coverage
+*.out
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+
+# User data - NEVER commit these
+.gogpt/
+*.enc
+
+# Debug
+debug.log
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
