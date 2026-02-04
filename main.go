@@ -54,6 +54,12 @@ type ClaudeClient struct {
 	streamMutex      sync.RWMutex
 }
 
+type ModelInfo struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	Description string
+}
+
 type ConversationResponse struct {
 	UUID         string        `json:"uuid"`
 	Name         string        `json:"name"`
@@ -88,6 +94,7 @@ type CompletionRequest struct {
 	Files              []interface{}            `json:"files"`
 	SyncSources        []interface{}            `json:"sync_sources"`
 	RenderingMode      string                   `json:"rendering_mode"`
+	Model              string                   `json:"model,omitempty"`
 }
 
 type Artifact struct {
@@ -137,6 +144,112 @@ type ContentBlock struct {
 	Language string
 	Title    string
 	ID       string
+}
+
+// ============== Available Models ==============
+
+type ModelsAPIResponse struct {
+	Data []struct {
+		ID          string    `json:"id"`
+		DisplayName string    `json:"display_name"`
+		CreatedAt   time.Time `json:"created_at"`
+		Type        string    `json:"type"`
+	} `json:"data"`
+}
+
+func (c *ClaudeClient) fetchAvailableModels() ([]ModelInfo, error) {
+	url := "https://api.anthropic.com/v1/models"
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("x-api-key", "dummy") // API doesn't require auth for model list
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to fetch models: status %d", resp.StatusCode)
+	}
+
+	var apiResp ModelsAPIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		return nil, err
+	}
+
+	models := make([]ModelInfo, 0, len(apiResp.Data))
+	for _, m := range apiResp.Data {
+		description := getModelDescription(m.ID)
+		models = append(models, ModelInfo{
+			ID:          m.ID,
+			DisplayName: m.DisplayName,
+			Description: description,
+		})
+	}
+
+	return models, nil
+}
+
+func getModelDescription(modelID string) string {
+	// Add helpful descriptions based on model name patterns
+	if strings.Contains(modelID, "opus-4-5") || strings.Contains(modelID, "opus-4.5") {
+		return "Best for: multi-day projects, enterprise workflows, frontier intelligence"
+	} else if strings.Contains(modelID, "opus-4-1") || strings.Contains(modelID, "opus-4.1") {
+		return "Best for: AI agents, agentic search, expert coding"
+	} else if strings.Contains(modelID, "sonnet-4-5") || strings.Contains(modelID, "sonnet-4.5") {
+		return "Best for: complex code, computer use, agents, office files"
+	} else if strings.Contains(modelID, "sonnet-4") {
+		return "Best for: everyday tasks with speed and cost balance"
+	} else if strings.Contains(modelID, "haiku-4-5") || strings.Contains(modelID, "haiku-4.5") {
+		return "Best for: fast responses, high volume, cost efficiency"
+	} else if strings.Contains(modelID, "sonnet-3") {
+		return "Legacy model"
+	}
+	return "Claude AI model"
+}
+
+func getFallbackModels() []ModelInfo {
+	// Fallback list in case API fetch fails
+	return []ModelInfo{
+		{
+			ID:          "claude-sonnet-4-5-20250929",
+			DisplayName: "Claude Sonnet 4.5",
+			Description: "Best for: complex code, computer use, agents, office files",
+		},
+		{
+			ID:          "claude-sonnet-4-20250514",
+			DisplayName: "Claude Sonnet 4",
+			Description: "Best for: everyday tasks with speed and cost balance",
+		},
+		{
+			ID:          "claude-opus-4-5-20251101",
+			DisplayName: "Claude Opus 4.5",
+			Description: "Best for: multi-day projects, enterprise workflows, frontier intelligence",
+		},
+		{
+			ID:          "claude-opus-4-1-20250805",
+			DisplayName: "Claude Opus 4.1",
+			Description: "Best for: AI agents, agentic search, expert coding",
+		},
+		{
+			ID:          "claude-haiku-4-5-20251001",
+			DisplayName: "Claude Haiku 4.5",
+			Description: "Best for: fast responses, high volume, cost efficiency",
+		},
+		{
+			ID:          "claude-3-7-sonnet-20250219",
+			DisplayName: "Claude 3.7 Sonnet",
+			Description: "Legacy: older sonnet model",
+		},
+	}
 }
 
 // ============== Path Utilities ==============
@@ -601,7 +714,7 @@ func (c *ClaudeClient) renameConversation(conversationID, newName string) error 
 	return nil
 }
 
-func (c *ClaudeClient) sendMessage(ctx context.Context, prompt, conversationID string) (string, bool, []Artifact, map[string][]EditOperation, bool) {
+func (c *ClaudeClient) sendMessage(ctx context.Context, prompt, conversationID, modelID string) (string, bool, []Artifact, map[string][]EditOperation, bool) {
 	url := fmt.Sprintf("https://claude.ai/api/organizations/%s/chat_conversations/%s/completion",
 		c.organizationID, conversationID)
 
@@ -632,6 +745,7 @@ func (c *ClaudeClient) sendMessage(ctx context.Context, prompt, conversationID s
 		Files:         []interface{}{},
 		SyncSources:   []interface{}{},
 		RenderingMode: "messages",
+		Model:         modelID,
 	}
 
 	jsonData, _ := json.Marshal(reqBody)
@@ -912,6 +1026,8 @@ type selectionModel struct {
 	currentPage   int
 	selected      *ConversationResponse
 	quit          bool
+	selectModel   bool
+	modelSelected string
 }
 
 func initialSelectionModel(client *ClaudeClient, conversations []ConversationResponse) selectionModel {
@@ -997,6 +1113,7 @@ func (m selectionModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			if m.cursor == 0 {
 				m.selected = nil
+				m.selectModel = true
 			} else {
 				startIndex := m.currentPage * pageSize
 				actualIndex := startIndex + (m.cursor - 1)
@@ -1035,20 +1152,7 @@ func (m selectionModel) View() string {
 			name = "Untitled chat"
 		}
 
-		firstMessage := "(Empty)"
-		for _, msg := range conv.ChatMessages {
-			if msg.Sender == "human" && msg.Text != "" {
-				text := msg.Text
-				if len(text) > snippetLength {
-					firstMessage = text[:snippetLength] + "..."
-				} else {
-					firstMessage = text
-				}
-				break
-			}
-		}
-
-		line := fmt.Sprintf("%sContinue: %s (%s) - \"%s\"\n", cursor, name, conv.UUID[:8], firstMessage)
+		line := fmt.Sprintf("%sContinue: %s (%s)\n", cursor, name, conv.UUID[:8])
 		b.WriteString(line)
 	}
 
@@ -1064,9 +1168,89 @@ func (m selectionModel) View() string {
 	return b.String()
 }
 
+// ============== Model Selection ==============
+
+type modelSelectionModel struct {
+	models   []ModelInfo
+	cursor   int
+	selected string
+	quit     bool
+	loading  bool
+	errMsg   string
+}
+
+func initialModelSelectionModel(client *ClaudeClient) modelSelectionModel {
+	// Try to fetch models from API
+	models, err := client.fetchAvailableModels()
+	if err != nil {
+		// Fallback to hardcoded list
+		models = getFallbackModels()
+	}
+
+	return modelSelectionModel{
+		models:  models,
+		cursor:  0,
+		loading: false,
+	}
+}
+
+func (m modelSelectionModel) Init() tea.Cmd { return nil }
+
+func (m modelSelectionModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "q":
+			m.quit = true
+			return m, tea.Quit
+
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+			}
+
+		case "down", "j":
+			if m.cursor < len(m.models)-1 {
+				m.cursor++
+			}
+
+		case "enter":
+			m.selected = m.models[m.cursor].ID
+			return m, tea.Quit
+		}
+	}
+	return m, nil
+}
+
+func (m modelSelectionModel) View() string {
+	var b strings.Builder
+	b.WriteString("Select Claude Model\n")
+
+	if m.errMsg != "" {
+		b.WriteString(fmt.Sprintf("(Using fallback list - API fetch failed)\n"))
+	}
+	b.WriteString("\n")
+
+	for i, model := range m.models {
+		cursor := "  "
+		if m.cursor == i {
+			cursor = "> "
+		}
+
+		b.WriteString(fmt.Sprintf("%s%s\n", cursor, model.DisplayName))
+		b.WriteString(fmt.Sprintf("   %s\n", model.Description))
+		if i < len(m.models)-1 {
+			b.WriteString("\n")
+		}
+	}
+
+	b.WriteString("\n(j/k: move, enter: select, q: quit)\n")
+	return b.String()
+}
+
 // ============== Simple CLI Chat ==============
 
-func runSimpleChat(client *ClaudeClient, conversationID string, isNew bool) bool {
+func runSimpleChat(client *ClaudeClient, conversationID string, isNew bool, modelID string) bool {
 	conv := client.getConversationDetails(conversationID)
 
 	if len(conv.ChatMessages) > 0 {
@@ -1097,6 +1281,19 @@ func runSimpleChat(client *ClaudeClient, conversationID string, isNew bool) bool
 	} else {
 		fmt.Printf("%s%s%s\n", colorClaude, separator, colorReset)
 	}
+
+	// Display selected model
+	var modelDisplayName string
+	for _, m := range getFallbackModels() {
+		if m.ID == modelID {
+			modelDisplayName = m.DisplayName
+			break
+		}
+	}
+	if modelDisplayName == "" {
+		modelDisplayName = modelID
+	}
+	fmt.Printf("Using model: %s\n", modelDisplayName)
 
 	fmt.Println("Type your message, then '.' on a new line to send.")
 	fmt.Println("Commands: !exit, !files (list/download files)")
@@ -1390,7 +1587,7 @@ func runSimpleChat(client *ClaudeClient, conversationID string, isNew bool) bool
 			}
 		}()
 
-		_, _, artifacts, editedFiles, cancelled := client.sendMessage(ctx, userInput, conversationID)
+		_, _, artifacts, editedFiles, cancelled := client.sendMessage(ctx, userInput, conversationID, modelID)
 
 		cancel()
 		<-keyboardDone
@@ -1576,16 +1773,45 @@ func main() {
 
 		var conversationID string
 		var isNew bool
+		var selectedModel string
 
 		if finalModel.selected == nil {
+			// Starting new chat - prompt for model selection
+			if finalModel.selectModel {
+				mp := tea.NewProgram(initialModelSelectionModel(client))
+				mm, err := mp.Run()
+				if err != nil {
+					log.Fatalf("Error running model selection UI: %v", err)
+				}
+
+				modelModel, ok := mm.(modelSelectionModel)
+				if !ok {
+					log.Fatalf("Could not determine model selection.")
+				}
+
+				if modelModel.quit {
+					fmt.Println("Goodbye!")
+					return
+				}
+
+				selectedModel = modelModel.selected
+			}
+
 			conversationID = client.createNewChat()
 			isNew = true
 		} else {
 			conversationID = finalModel.selected.UUID
 			isNew = false
+			// For continuing chats, use default model (or could be extended to allow changing)
+			selectedModel = "claude-sonnet-4-5-20250929"
 		}
 
-		continueLoop := runSimpleChat(client, conversationID, isNew)
+		// If no model selected, use default
+		if selectedModel == "" {
+			selectedModel = "claude-sonnet-4-5-20250929"
+		}
+
+		continueLoop := runSimpleChat(client, conversationID, isNew, selectedModel)
 		if !continueLoop {
 			fmt.Println("Goodbye!")
 			return
