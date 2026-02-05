@@ -7,6 +7,7 @@ A terminal client for Claude.ai that lets you chat with Claude directly from you
 ## Features
 
 - **Interactive chat** — Full conversation support with streaming responses
+- **MCP support** — Connect external tools via Model Context Protocol
 - **Conversation management** — Create new chats or continue existing ones
 - **File handling** — View and download files created by Claude
 - **Artifact support** — Captures code artifacts and file creations
@@ -85,22 +86,17 @@ Once in a chat:
 |---------|-------------|
 | `!exit` | Return to conversation selector |
 | `!files` | List and download files from the conversation |
-| `!artifacts` | View locally cached artifacts (may be outdated) |
+| `!mcp` | List available MCP tools |
 
 ### Example Session
 
 ```
 ────────────────────────────────────────────────────────────
 You: Write a hello world in Go
-.
 ────────────────────────────────────────────────────────────
 
 ────────────────────────────────────────────────────────────
 Claude: Here's a simple Hello World program in Go:
-
-[creating file] done
-
-The file has been created. You can run it with `go run main.go`.
 ────────────────────────────────────────────────────────────
 
 [artifact] main.go
@@ -112,8 +108,6 @@ import "fmt"
 func main() {
     fmt.Println("Hello, World!")
 }
-```
-
 ```
 
 ### Downloading Files
@@ -134,11 +128,73 @@ Use `!files` to see all files Claude has created:
 Enter number to view, 'a' to download all, or press enter to skip:
 ```
 
+## MCP (Model Context Protocol) Support
+
+gogpt supports MCP servers, allowing Claude to use external tools during conversations.
+
+### Configuration
+
+Create `~/.gogpt/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "zig-docs": {
+      "command": "npx",
+      "args": ["-y", "zig-mcp@latest"]
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@anthropic/mcp-server-filesystem", "/home/user/projects"]
+    }
+  }
+}
+```
+
+### How It Works
+
+1. MCP servers start automatically when gogpt launches
+2. Available tools are shown: `MCP tools available: 4 (use !mcp to list)`
+3. When Claude needs a tool, you'll see: `[MCP: calling search_std_lib] done`
+4. Results are automatically fed back to Claude to continue the response
+
+### Example with MCP
+
+```
+────────────────────────────────────────────────────────────
+You: How do I use ArrayList in Zig?
+────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────
+Claude: Let me look that up for you.
+────────────────────────────────────────────────────────────
+[MCP: calling search_std_lib] done
+
+────────────────────────────────────────────────────────────
+Claude: Here's how to use ArrayList in Zig...
+────────────────────────────────────────────────────────────
+```
+
+### Listing Tools
+
+Use `!mcp` to see all available tools:
+
+```
+=== MCP Tools (4) ===
+
+• list_builtin_functions [zig-docs]
+  Lists all available Zig builtin functions...
+
+• search_std_lib [zig-docs]
+  Search the Zig standard library...
+```
+
 ## File Storage
 
 ```
 ~/.gogpt/
 ├── cookies.enc      # Your session cookies (base64)
+├── mcp.json         # MCP server configuration
 ├── artifacts/       # Cached artifacts by conversation
 │   └── {conv-id}.json
 └── files/           # Auto-saved files
@@ -175,6 +231,10 @@ Your cookies have expired or are invalid. Delete `~/.gogpt/cookies.enc` and rest
 
 Usually means expired cookies. Get fresh cookies from claude.ai.
 
+### "Warning: Failed to load MCP config"
+
+Check that `~/.gogpt/mcp.json` exists and is valid JSON. The tool will still work without MCP.
+
 ### Streaming stops unexpectedly
 
 Check your internet connection. The client uses Server-Sent Events which require a stable connection.
@@ -182,6 +242,12 @@ Check your internet connection. The client uses Server-Sent Events which require
 ### Files not showing in `!files`
 
 Files appear after Claude's computer use tools finish executing. Give it a moment and try again.
+
+### MCP tools not working
+
+- Ensure the MCP server command is installed (e.g., `npx` requires Node.js)
+- Check the server logs for errors
+- Verify the config syntax in `mcp.json`
 
 ## Disclaimer
 

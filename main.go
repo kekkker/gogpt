@@ -38,6 +38,7 @@ const (
 const (
 	colorUser   = "\033[0m"
 	colorClaude = "\033[0m"
+	colorMCP    = "\033[33m" // Yellow for MCP
 	colorReset  = "\033[0m"
 	separator   = "────────────────────────────────────────────────────────────"
 )
@@ -52,6 +53,7 @@ type ClaudeClient struct {
 	streaming        bool
 	cancelStream     chan bool
 	streamMutex      sync.RWMutex
+	mcpManager       *MCPManager
 }
 
 type ModelInfo struct {
@@ -167,7 +169,7 @@ func (c *ClaudeClient) fetchAvailableModels() ([]ModelInfo, error) {
 	}
 
 	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("x-api-key", "dummy") // API doesn't require auth for model list
+	req.Header.Set("x-api-key", "dummy")
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
@@ -199,7 +201,6 @@ func (c *ClaudeClient) fetchAvailableModels() ([]ModelInfo, error) {
 }
 
 func getModelDescription(modelID string) string {
-	// Add helpful descriptions based on model name patterns
 	if strings.Contains(modelID, "opus-4-5") || strings.Contains(modelID, "opus-4.5") {
 		return "Best for: multi-day projects, enterprise workflows, frontier intelligence"
 	} else if strings.Contains(modelID, "opus-4-1") || strings.Contains(modelID, "opus-4.1") {
@@ -217,7 +218,6 @@ func getModelDescription(modelID string) string {
 }
 
 func getFallbackModels() []ModelInfo {
-	// Fallback list in case API fetch fails
 	return []ModelInfo{
 		{
 			ID:          "claude-sonnet-4-5-20250929",
@@ -338,14 +338,6 @@ func appendArtifacts(conversationID string, newArtifacts []Artifact) error {
 	return saveArtifacts(conversationID, existing)
 }
 
-func getConversationFilesDir(conversationID string) string {
-	dir := filepath.Join(getPath(savedFilesDir), conversationID[:8])
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		os.MkdirAll(dir, 0755)
-	}
-	return dir
-}
-
 func inferLanguageFromFilename(filename string) string {
 	filename = strings.ToLower(filename)
 	if idx := strings.LastIndex(filename, "/"); idx != -1 {
@@ -358,6 +350,7 @@ func inferLanguageFromFilename(filename string) string {
 		".json": "json", ".sh": "bash", ".md": "markdown", ".yaml": "yaml",
 		".yml": "yaml", ".sql": "sql", ".rs": "rust", ".java": "java",
 		".c": "c", ".h": "c", ".cpp": "cpp", ".hpp": "cpp", ".cc": "cpp",
+		".zig": "zig",
 	}
 
 	for ext, lang := range extensions {
@@ -417,7 +410,7 @@ func (c *ClaudeClient) listRemoteFiles(conversationID string) ([]Artifact, error
 			Size:      meta.Size,
 			Language:  inferLanguageFromFilename(fileName),
 			CreatedAt: createdAt,
-			Content:   "", // Content will be fetched on demand
+			Content:   "",
 		})
 	}
 
@@ -425,7 +418,6 @@ func (c *ClaudeClient) listRemoteFiles(conversationID string) ([]Artifact, error
 }
 
 func (c *ClaudeClient) downloadRemoteFile(conversationID, filePath string) (string, error) {
-	// URL encode the path parameter
 	encodedPath := url.QueryEscape(filePath)
 	url := fmt.Sprintf("https://claude.ai/api/organizations/%s/conversations/%s/wiggle/download-file?path=%s",
 		c.organizationID, conversationID, encodedPath)
@@ -503,8 +495,16 @@ func NewClaudeClient() *ClaudeClient {
 		deviceID:         generateDeviceID(),
 		sessionArtifacts: make(map[string][]Artifact),
 		cancelStream:     make(chan bool, 1),
+		mcpManager:       NewMCPManager(),
 	}
 	client.organizationID = client.getOrganizationID()
+
+	// Load MCP servers
+	fmt.Println()
+	if err := client.mcpManager.LoadConfig(); err != nil {
+		fmt.Printf("Warning: Failed to load MCP config: %v\n", err)
+	}
+
 	return client
 }
 
@@ -731,8 +731,14 @@ func (c *ClaudeClient) sendMessage(ctx context.Context, prompt, conversationID, 
 		{"type": "repl_v0", "name": "repl"},
 	}
 
+	// Inject MCP tools prompt if available
+	finalPrompt := prompt
+	if c.mcpManager.HasTools() {
+		finalPrompt = prompt + c.mcpManager.GetToolsPrompt()
+	}
+
 	reqBody := CompletionRequest{
-		Prompt:            prompt,
+		Prompt:            finalPrompt,
 		ParentMessageUUID: parentUUID,
 		Timezone:          "UTC",
 		PersonalizedStyles: []map[string]interface{}{
@@ -790,6 +796,7 @@ func (c *ClaudeClient) sendMessage(ctx context.Context, prompt, conversationID, 
 func (c *ClaudeClient) readStreamResponse(ctx context.Context, body io.ReadCloser) (string, bool, []Artifact, map[string][]EditOperation, bool) {
 	reader := bufio.NewReader(body)
 	var fullResponse strings.Builder
+	var displayBuffer strings.Builder // Buffer for detecting MCP tags before displaying
 	var currentEvent string
 	state := &StreamState{
 		CurrentArtifactInput: make(map[string]interface{}),
@@ -798,6 +805,8 @@ func (c *ClaudeClient) readStreamResponse(ctx context.Context, body io.ReadClose
 	contentBlocks := make(map[int]*ContentBlock)
 	needsContinuation := false
 	cancelled := false
+	inMCPTag := false
+	mcpTagBuffer := strings.Builder{}
 
 	for {
 		select {
@@ -844,8 +853,53 @@ func (c *ClaudeClient) readStreamResponse(ctx context.Context, body io.ReadClose
 			case "content_block_start":
 				c.handleContentBlockStart(jsonData, state, contentBlocks)
 			case "content_block_delta":
-				c.handleContentBlockDelta(jsonData, state, contentBlocks, &fullResponse)
+				// Handle text delta with MCP tag detection
+				if delta, ok := jsonData["delta"].(map[string]interface{}); ok {
+					if deltaType, _ := delta["type"].(string); deltaType == "text_delta" {
+						if text, ok := delta["text"].(string); ok {
+							fullResponse.WriteString(text)
+
+							// Process character by character for MCP tag detection
+							for _, ch := range text {
+								if inMCPTag {
+									mcpTagBuffer.WriteRune(ch)
+									// Check if we've completed the closing tag
+									if strings.HasSuffix(mcpTagBuffer.String(), "</mcp_tool_call>") {
+										// Don't display the MCP tag content
+										inMCPTag = false
+										mcpTagBuffer.Reset()
+									}
+								} else {
+									displayBuffer.WriteRune(ch)
+									bufStr := displayBuffer.String()
+
+									// Check if we're starting an MCP tag
+									if strings.HasSuffix(bufStr, "<mcp_tool_call>") {
+										// Remove the tag from display buffer and start capturing
+										displayStr := bufStr[:len(bufStr)-len("<mcp_tool_call>")]
+										fmt.Print(displayStr)
+										displayBuffer.Reset()
+										inMCPTag = true
+										mcpTagBuffer.WriteString("<mcp_tool_call>")
+									} else if len(bufStr) > 20 && !strings.Contains(bufStr[len(bufStr)-20:], "<") {
+										// No potential tag start in last 20 chars, safe to flush
+										fmt.Print(bufStr)
+										displayBuffer.Reset()
+									}
+								}
+							}
+						}
+					} else {
+						// Handle other delta types normally
+						c.handleContentBlockDeltaNonText(jsonData, state, contentBlocks)
+					}
+				}
 			case "content_block_stop":
+				// Flush any remaining display buffer
+				if displayBuffer.Len() > 0 {
+					fmt.Print(displayBuffer.String())
+					displayBuffer.Reset()
+				}
 				c.handleContentBlockStop(jsonData, state, contentBlocks)
 			case "message_delta":
 				if delta, ok := jsonData["delta"].(map[string]interface{}); ok {
@@ -855,6 +909,11 @@ func (c *ClaudeClient) readStreamResponse(ctx context.Context, body io.ReadClose
 				}
 			}
 		}
+	}
+
+	// Flush any remaining buffer
+	if displayBuffer.Len() > 0 {
+		fmt.Print(displayBuffer.String())
 	}
 
 	return fullResponse.String(), needsContinuation, state.CapturedArtifacts, state.EditedFiles, cancelled
@@ -901,6 +960,27 @@ func (c *ClaudeClient) handleContentBlockStart(jsonData map[string]interface{}, 
 	}
 
 	blocks[index] = block
+}
+
+func (c *ClaudeClient) handleContentBlockDeltaNonText(jsonData map[string]interface{}, state *StreamState, blocks map[int]*ContentBlock) {
+	delta, ok := jsonData["delta"].(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	deltaType, _ := delta["type"].(string)
+
+	switch deltaType {
+	case "input_json_delta":
+		if partialJSON, ok := delta["partial_json"].(string); ok {
+			state.ToolInput.WriteString(partialJSON)
+		}
+
+	case "tool_result_delta":
+		if content, ok := delta["content"].(string); ok {
+			state.ToolResultContent.WriteString(content)
+		}
+	}
 }
 
 func (c *ClaudeClient) handleContentBlockDelta(jsonData map[string]interface{}, state *StreamState, blocks map[int]*ContentBlock, fullResponse *strings.Builder) {
@@ -1180,10 +1260,8 @@ type modelSelectionModel struct {
 }
 
 func initialModelSelectionModel(client *ClaudeClient) modelSelectionModel {
-	// Try to fetch models from API
 	models, err := client.fetchAvailableModels()
 	if err != nil {
-		// Fallback to hardcoded list
 		models = getFallbackModels()
 	}
 
@@ -1295,10 +1373,15 @@ func runSimpleChat(client *ClaudeClient, conversationID string, isNew bool, mode
 	}
 	fmt.Printf("Using model: %s\n", modelDisplayName)
 
+	// Show MCP tools if available
+	if client.mcpManager.HasTools() {
+		tools := client.mcpManager.GetAllTools()
+		fmt.Printf("MCP tools available: %d (use !mcp to list)\n", len(tools))
+	}
+
 	fmt.Println("Type your message, then '.' on a new line to send.")
-	fmt.Println("Commands: !exit, !files (list/download files)")
+	fmt.Println("Commands: !exit, !files, !mcp")
 	fmt.Println("Press ESC during streaming to cancel the response.")
-	fmt.Println("Note: Use !files to see actual files from Claude's servers (always accurate)")
 
 	scanner := bufio.NewScanner(os.Stdin)
 	isFirstMessage := isNew
@@ -1322,62 +1405,26 @@ func runSimpleChat(client *ClaudeClient, conversationID string, isNew bool, mode
 					return true
 				}
 
-				if trimmed == "!artifacts" {
+				if trimmed == "!mcp" {
 					fmt.Printf("%s%s%s\n", colorUser, separator, colorReset)
-					fmt.Println("⚠️  Warning: !artifacts shows local cache which may be outdated/buggy")
-					fmt.Println("→ Use !files instead to fetch actual files from Claude's servers")
-					fmt.Println()
-
-					artifacts := loadArtifacts(conversationID)
-					if len(artifacts) == 0 {
-						fmt.Println("No artifacts in local cache.")
+					tools := client.mcpManager.GetAllTools()
+					if len(tools) == 0 {
+						fmt.Println("No MCP tools loaded.")
+						fmt.Printf("Add servers to %s\n", getPath("mcp.json"))
+						fmt.Println("\nExample config:")
+						fmt.Println(`{
+  "mcpServers": {
+    "zig-docs": {
+      "command": "npx",
+      "args": ["-y", "zig-mcp@latest"]
+    }
+  }
+}`)
 					} else {
-						fmt.Printf("=== Local Artifacts Cache (%d) ===\n\n", len(artifacts))
-						for i, art := range artifacts {
-							typeIcon := "file"
-							if art.Type == "artifact" {
-								typeIcon = "artifact"
-							} else if art.Type == "view" {
-								typeIcon = "view"
-							}
-
-							title := art.Title
-							if title == "" {
-								title = art.FileName
-							}
-							if title == "" {
-								title = fmt.Sprintf("Artifact %d", i+1)
-							}
-
-							langDisplay := art.Language
-							if langDisplay == "" {
-								langDisplay = "text"
-							}
-
-							fmt.Printf("[%d] [%s] %s (%s)\n", i+1, typeIcon, title, langDisplay)
-						}
-
-						fmt.Print("\nEnter number to view (or press enter to skip): ")
-						reader := bufio.NewReader(os.Stdin)
-						choiceStr, _ := reader.ReadString('\n')
-						choiceStr = strings.TrimSpace(choiceStr)
-
-						if choiceStr != "" {
-							choice, err := strconv.Atoi(choiceStr)
-							if err == nil && choice >= 1 && choice <= len(artifacts) {
-								art := artifacts[choice-1]
-								fmt.Printf("\n=== Artifact: %s ===\n\n", art.Title)
-								lang := art.Language
-								if lang == "" {
-									lang = "text"
-								}
-								fmt.Printf("```%s\n", lang)
-								fmt.Print(art.Content)
-								if !strings.HasSuffix(art.Content, "\n") {
-									fmt.Println()
-								}
-								fmt.Printf("```\n\n")
-							}
+						fmt.Printf("=== MCP Tools (%d) ===\n\n", len(tools))
+						for _, tool := range tools {
+							fmt.Printf("%s• %s%s [%s]\n", colorMCP, tool.Name, colorReset, tool.ServerName)
+							fmt.Printf("  %s\n\n", tool.Description)
 						}
 					}
 					continue
@@ -1401,7 +1448,6 @@ func runSimpleChat(client *ClaudeClient, conversationID string, isNew bool, mode
 						fmt.Println("(Always up-to-date with web interface)\n")
 
 						for i, art := range remoteArtifacts {
-							// Format file size
 							sizeStr := ""
 							if art.Size > 0 {
 								if art.Size < 1024 {
@@ -1425,7 +1471,6 @@ func runSimpleChat(client *ClaudeClient, conversationID string, isNew bool, mode
 						choiceStr = strings.TrimSpace(strings.ToLower(choiceStr))
 
 						if choiceStr == "a" || choiceStr == "all" {
-							// Download all files preserving directory structure
 							fmt.Print("\nWhere to download? (default: /tmp): ")
 							baseDir, _ := reader.ReadString('\n')
 							baseDir = strings.TrimSpace(baseDir)
@@ -1441,8 +1486,6 @@ func runSimpleChat(client *ClaudeClient, conversationID string, isNew bool, mode
 							failCount := 0
 
 							for i, art := range remoteArtifacts {
-								// Use the full path from art.FileName to preserve structure
-								// Remove leading /mnt/user-data/outputs/ prefix if present
 								relativePath := art.FileName
 								if strings.HasPrefix(relativePath, "/mnt/user-data/outputs/") {
 									relativePath = strings.TrimPrefix(relativePath, "/mnt/user-data/outputs/")
@@ -1450,7 +1493,6 @@ func runSimpleChat(client *ClaudeClient, conversationID string, isNew bool, mode
 
 								destinationPath := filepath.Join(baseDir, relativePath)
 
-								// Create directory structure
 								destDir := filepath.Dir(destinationPath)
 								if err := os.MkdirAll(destDir, 0755); err != nil {
 									fmt.Printf("[%d/%d] %s... ✗ Failed to create directory: %v\n", i+1, len(remoteArtifacts), art.Title, err)
@@ -1529,210 +1571,248 @@ func runSimpleChat(client *ClaudeClient, conversationID string, isNew bool, mode
 
 		fmt.Printf("%s%s%s\n\n", colorUser, separator, colorReset)
 
-		fmt.Printf("%s%s%s\n", colorClaude, separator, colorReset)
-		fmt.Printf("%sClaude:%s ", colorClaude, colorReset)
+		// MCP tool call loop
+		currentPrompt := userInput
+		mcpContext := ""
 
-		select {
-		case <-client.cancelStream:
-		default:
-		}
+		for {
+			fmt.Printf("%s%s%s\n", colorClaude, separator, colorReset)
+			fmt.Printf("%sClaude:%s ", colorClaude, colorReset)
 
-		ctx, cancel := context.WithCancel(context.Background())
-		keyboardDone := make(chan bool)
-
-		go func() {
-			defer close(keyboardDone)
-
-			time.Sleep(100 * time.Millisecond)
-
-			if err := keyboard.Open(); err != nil {
-				return
+			select {
+			case <-client.cancelStream:
+			default:
 			}
-			defer keyboard.Close()
 
-			keyEvents := make(chan keyboard.Key, 10)
+			ctx, cancel := context.WithCancel(context.Background())
+			keyboardDone := make(chan bool)
+
 			go func() {
-				for {
-					_, key, err := keyboard.GetKey()
-					if err != nil {
-						close(keyEvents)
-						return
+				defer close(keyboardDone)
+
+				time.Sleep(100 * time.Millisecond)
+
+				if err := keyboard.Open(); err != nil {
+					return
+				}
+				defer keyboard.Close()
+
+				keyEvents := make(chan keyboard.Key, 10)
+				go func() {
+					for {
+						_, key, err := keyboard.GetKey()
+						if err != nil {
+							close(keyEvents)
+							return
+						}
+						keyEvents <- key
 					}
-					keyEvents <- key
+				}()
+
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case key, ok := <-keyEvents:
+						if !ok {
+							return
+						}
+
+						if key == keyboard.KeyEsc {
+							if client.isStreaming() {
+								go client.stopResponse(conversationID)
+
+								select {
+								case client.cancelStream <- true:
+								default:
+								}
+								cancel()
+								return
+							}
+						}
+					}
 				}
 			}()
 
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case key, ok := <-keyEvents:
-					if !ok {
-						return
-					}
-
-					if key == keyboard.KeyEsc {
-						if client.isStreaming() {
-							go client.stopResponse(conversationID)
-
-							select {
-							case client.cancelStream <- true:
-							default:
-							}
-							cancel()
-							return
-						}
-					}
-				}
+			// Build prompt with MCP context if we have tool results
+			promptToSend := currentPrompt
+			if mcpContext != "" {
+				promptToSend = currentPrompt + "\n\n" + mcpContext
 			}
-		}()
 
-		_, _, artifacts, editedFiles, cancelled := client.sendMessage(ctx, userInput, conversationID, modelID)
+			response, _, artifacts, editedFiles, cancelled := client.sendMessage(ctx, promptToSend, conversationID, modelID)
 
-		cancel()
-		<-keyboardDone
+			cancel()
+			<-keyboardDone
 
-		if cancelled {
-			fmt.Printf("\n\n[Stream cancelled by user]\n")
-			fmt.Printf("%s%s%s\n\n", colorClaude, separator, colorReset)
-			continue
-		}
-
-		fmt.Printf("\n%s%s%s\n\n", colorClaude, separator, colorReset)
-
-		if len(artifacts) > 0 {
-			client.sessionArtifacts[conversationID] = append(client.sessionArtifacts[conversationID], artifacts...)
-			appendArtifacts(conversationID, artifacts)
-
-			for _, art := range artifacts {
-				if art.Content != "" && (art.Type == "file" || art.Type == "artifact") {
-					fmt.Printf("\n[artifact] %s\n", art.Title)
-					lang := art.Language
-					if lang == "" {
-						lang = "text"
-					}
-					fmt.Printf("```%s\n", lang)
-					fmt.Print(art.Content)
-					if !strings.HasSuffix(art.Content, "\n") {
-						fmt.Println()
-					}
-					fmt.Printf("```\n\n")
-				}
+			if cancelled {
+				fmt.Printf("\n\n[Stream cancelled by user]\n")
+				fmt.Printf("%s%s%s\n\n", colorClaude, separator, colorReset)
+				break
 			}
-		}
 
-		if len(editedFiles) > 0 {
-			// Collect all edited files
-			editedFilePaths := make([]string, 0, len(editedFiles))
-			for filePath := range editedFiles {
-				editedFilePaths = append(editedFilePaths, filePath)
-			}
-			sort.Strings(editedFilePaths)
+			fmt.Printf("\n%s%s%s\n\n", colorClaude, separator, colorReset)
 
-			fmt.Printf("\n[edited %d file(s)] ", len(editedFilePaths))
-			for i, path := range editedFilePaths {
-				if i > 0 {
-					fmt.Print(", ")
-				}
-				fmt.Print(filepath.Base(path))
-			}
-			fmt.Println()
+			// Check for MCP tool calls in the response
+			toolCalls := ParseMCPToolCalls(response)
 
-			// Give Claude a moment to save the files
-			time.Sleep(500 * time.Millisecond)
+			if len(toolCalls) > 0 && client.mcpManager.HasTools() {
+				// Execute MCP tool calls
+				var toolResults strings.Builder
+				toolResults.WriteString("MCP Tool Results:\n")
 
-			// Fetch updated files from remote
-			fmt.Println("Fetching updated files from server...")
-			remoteFiles, err := client.listRemoteFiles(conversationID)
-			if err != nil {
-				fmt.Printf("Warning: Could not fetch remote files: %v\n", err)
-			} else {
-				// Build a map of remote files by base name
-				remoteFileMap := make(map[string]Artifact)
-				for _, rf := range remoteFiles {
-					baseName := filepath.Base(rf.FileName)
-					remoteFileMap[baseName] = rf
-				}
+				for _, call := range toolCalls {
+					fmt.Printf("%s[MCP: calling %s]%s ", colorMCP, call.Tool, colorReset)
 
-				// Download and display edited files
-				if len(editedFilePaths) == 1 {
-					// Single file - show it immediately
-					filePath := editedFilePaths[0]
-					baseName := filepath.Base(filePath)
-
-					if remoteArt, exists := remoteFileMap[baseName]; exists {
-						content, err := client.downloadRemoteFile(conversationID, remoteArt.FileName)
-						if err != nil {
-							fmt.Printf("Warning: Could not download %s: %v\n", baseName, err)
-						} else {
-							fmt.Printf("\n=== Updated: %s ===\n\n", baseName)
-							lang := remoteArt.Language
-							if lang == "" {
-								lang = "text"
-							}
-							fmt.Printf("```%s\n", lang)
-							fmt.Print(content)
-							if !strings.HasSuffix(content, "\n") {
-								fmt.Println()
-							}
-							fmt.Printf("```\n\n")
-						}
+					result, err := client.mcpManager.CallTool(call.Tool, call.Arguments)
+					if err != nil {
+						fmt.Printf("error: %v\n", err)
+						toolResults.WriteString(fmt.Sprintf("\n<tool_result name=\"%s\" error=\"true\">\n%s\n</tool_result>\n", call.Tool, err.Error()))
 					} else {
-						fmt.Printf("Warning: %s not found in remote files\n", baseName)
+						fmt.Printf("done\n")
+						// Truncate very long results for display
+						displayResult := result
+						if len(displayResult) > 500 {
+							displayResult = displayResult[:500] + "... [truncated]"
+						}
+						toolResults.WriteString(fmt.Sprintf("\n<tool_result name=\"%s\">\n%s\n</tool_result>\n", call.Tool, result))
 					}
+				}
+
+				// Continue the conversation with tool results
+				mcpContext = toolResults.String()
+				currentPrompt = "Here are the results from the MCP tools you called. Please continue your response using this information:"
+				continue
+			}
+
+			// No more tool calls, we're done
+			if len(artifacts) > 0 {
+				client.sessionArtifacts[conversationID] = append(client.sessionArtifacts[conversationID], artifacts...)
+				appendArtifacts(conversationID, artifacts)
+
+				for _, art := range artifacts {
+					if art.Content != "" && (art.Type == "file" || art.Type == "artifact") {
+						fmt.Printf("\n[artifact] %s\n", art.Title)
+						lang := art.Language
+						if lang == "" {
+							lang = "text"
+						}
+						fmt.Printf("```%s\n", lang)
+						fmt.Print(art.Content)
+						if !strings.HasSuffix(art.Content, "\n") {
+							fmt.Println()
+						}
+						fmt.Printf("```\n\n")
+					}
+				}
+			}
+
+			if len(editedFiles) > 0 {
+				editedFilePaths := make([]string, 0, len(editedFiles))
+				for filePath := range editedFiles {
+					editedFilePaths = append(editedFilePaths, filePath)
+				}
+				sort.Strings(editedFilePaths)
+
+				fmt.Printf("\n[edited %d file(s)] ", len(editedFilePaths))
+				for i, path := range editedFilePaths {
+					if i > 0 {
+						fmt.Print(", ")
+					}
+					fmt.Print(filepath.Base(path))
+				}
+				fmt.Println()
+
+				time.Sleep(500 * time.Millisecond)
+
+				fmt.Println("Fetching updated files from server...")
+				remoteFiles, err := client.listRemoteFiles(conversationID)
+				if err != nil {
+					fmt.Printf("Warning: Could not fetch remote files: %v\n", err)
 				} else {
-					// Multiple files - show menu
-					fmt.Println("\nMultiple files were edited. Which would you like to view?")
-					for i, path := range editedFilePaths {
-						baseName := filepath.Base(path)
-						fmt.Printf("  [%d] %s\n", i+1, baseName)
-					}
-					fmt.Printf("  [a] View all\n")
-					fmt.Printf("  [n] Skip viewing (files are saved)\n")
-
-					reader := bufio.NewReader(os.Stdin)
-					fmt.Print("\nChoice: ")
-					choice, _ := reader.ReadString('\n')
-					choice = strings.TrimSpace(strings.ToLower(choice))
-
-					filesToShow := []string{}
-					if choice == "a" || choice == "all" {
-						filesToShow = editedFilePaths
-					} else if choice == "n" || choice == "" {
-						// Skip viewing
-						fmt.Println()
-					} else if choiceNum, err := strconv.Atoi(choice); err == nil && choiceNum >= 1 && choiceNum <= len(editedFilePaths) {
-						filesToShow = []string{editedFilePaths[choiceNum-1]}
+					remoteFileMap := make(map[string]Artifact)
+					for _, rf := range remoteFiles {
+						baseName := filepath.Base(rf.FileName)
+						remoteFileMap[baseName] = rf
 					}
 
-					// Display selected files
-					for _, filePath := range filesToShow {
+					if len(editedFilePaths) == 1 {
+						filePath := editedFilePaths[0]
 						baseName := filepath.Base(filePath)
 
 						if remoteArt, exists := remoteFileMap[baseName]; exists {
 							content, err := client.downloadRemoteFile(conversationID, remoteArt.FileName)
 							if err != nil {
 								fmt.Printf("Warning: Could not download %s: %v\n", baseName, err)
-								continue
+							} else {
+								fmt.Printf("\n=== Updated: %s ===\n\n", baseName)
+								lang := remoteArt.Language
+								if lang == "" {
+									lang = "text"
+								}
+								fmt.Printf("```%s\n", lang)
+								fmt.Print(content)
+								if !strings.HasSuffix(content, "\n") {
+									fmt.Println()
+								}
+								fmt.Printf("```\n\n")
 							}
-
-							fmt.Printf("\n=== Updated: %s ===\n\n", baseName)
-							lang := remoteArt.Language
-							if lang == "" {
-								lang = "text"
-							}
-							fmt.Printf("```%s\n", lang)
-							fmt.Print(content)
-							if !strings.HasSuffix(content, "\n") {
-								fmt.Println()
-							}
-							fmt.Printf("```\n\n")
 						} else {
 							fmt.Printf("Warning: %s not found in remote files\n", baseName)
+						}
+					} else {
+						fmt.Println("\nMultiple files were edited. Which would you like to view?")
+						for i, path := range editedFilePaths {
+							baseName := filepath.Base(path)
+							fmt.Printf("  [%d] %s\n", i+1, baseName)
+						}
+						fmt.Printf("  [a] View all\n")
+						fmt.Printf("  [n] Skip viewing (files are saved)\n")
+
+						reader := bufio.NewReader(os.Stdin)
+						fmt.Print("\nChoice: ")
+						choice, _ := reader.ReadString('\n')
+						choice = strings.TrimSpace(strings.ToLower(choice))
+
+						filesToShow := []string{}
+						if choice == "a" || choice == "all" {
+							filesToShow = editedFilePaths
+						} else if choice == "n" || choice == "" {
+							fmt.Println()
+						} else if choiceNum, err := strconv.Atoi(choice); err == nil && choiceNum >= 1 && choiceNum <= len(editedFilePaths) {
+							filesToShow = []string{editedFilePaths[choiceNum-1]}
+						}
+
+						for _, filePath := range filesToShow {
+							baseName := filepath.Base(filePath)
+
+							if remoteArt, exists := remoteFileMap[baseName]; exists {
+								content, err := client.downloadRemoteFile(conversationID, remoteArt.FileName)
+								if err != nil {
+									fmt.Printf("Warning: Could not download %s: %v\n", baseName, err)
+									continue
+								}
+
+								fmt.Printf("\n=== Updated: %s ===\n\n", baseName)
+								lang := remoteArt.Language
+								if lang == "" {
+									lang = "text"
+								}
+								fmt.Printf("```%s\n", lang)
+								fmt.Print(content)
+								if !strings.HasSuffix(content, "\n") {
+									fmt.Println()
+								}
+								fmt.Printf("```\n\n")
+							} else {
+								fmt.Printf("Warning: %s not found in remote files\n", baseName)
+							}
 						}
 					}
 				}
 			}
+
+			break // Exit the MCP tool loop
 		}
 
 		if isFirstMessage {
@@ -1767,6 +1847,7 @@ func main() {
 		}
 
 		if finalModel.quit {
+			client.mcpManager.Close()
 			fmt.Println("Goodbye!")
 			return
 		}
@@ -1776,7 +1857,6 @@ func main() {
 		var selectedModel string
 
 		if finalModel.selected == nil {
-			// Starting new chat - prompt for model selection
 			if finalModel.selectModel {
 				mp := tea.NewProgram(initialModelSelectionModel(client))
 				mm, err := mp.Run()
@@ -1790,6 +1870,7 @@ func main() {
 				}
 
 				if modelModel.quit {
+					client.mcpManager.Close()
 					fmt.Println("Goodbye!")
 					return
 				}
@@ -1802,17 +1883,16 @@ func main() {
 		} else {
 			conversationID = finalModel.selected.UUID
 			isNew = false
-			// For continuing chats, use default model (or could be extended to allow changing)
 			selectedModel = "claude-sonnet-4-5-20250929"
 		}
 
-		// If no model selected, use default
 		if selectedModel == "" {
 			selectedModel = "claude-sonnet-4-5-20250929"
 		}
 
 		continueLoop := runSimpleChat(client, conversationID, isNew, selectedModel)
 		if !continueLoop {
+			client.mcpManager.Close()
 			fmt.Println("Goodbye!")
 			return
 		}
