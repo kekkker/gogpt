@@ -18,30 +18,113 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
-
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/eiannone/keyboard"
-	"github.com/google/uuid"
+	"unsafe"
 )
 
 const (
-	baseDir       = ".gogpt"
-	cookiesFile   = "cookies.enc"
-	artifactsDir  = "artifacts"
-	savedFilesDir = "files"
-	snippetLength = 60
-	pageSize      = 10
+	baseDir      = ".gogpt"
+	cookiesFile  = "cookies.enc"
+	artifactsDir = "artifacts"
+	pageSize     = 10
 )
 
 // ANSI color codes
 const (
 	colorUser   = "\033[0m"
 	colorClaude = "\033[0m"
-	colorMCP    = "\033[33m" // Yellow for MCP
 	colorReset  = "\033[0m"
 	separator   = "────────────────────────────────────────────────────────────"
 )
+
+// ============== termios (pure syscall, no cgo) ==============
+
+type termios struct {
+	Iflag  uint32
+	Oflag  uint32
+	Cflag  uint32
+	Lflag  uint32
+	Cc     [20]byte
+	Ispeed uint32
+	Ospeed uint32
+}
+
+const (
+	tcGets = 0x5401
+	tcSets = 0x5402
+	icanon = 0x2
+	echoF  = 0x8
+	vminI  = 6
+	vtimeI = 5
+)
+
+func tcGetAttr(fd int) (*termios, error) {
+	var t termios
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), tcGets, uintptr(unsafe.Pointer(&t)))
+	if errno != 0 {
+		return nil, errno
+	}
+	return &t, nil
+}
+
+func tcSetAttr(fd int, t *termios) error {
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), tcSets, uintptr(unsafe.Pointer(t)))
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+var savedTermios *termios
+
+func rawOn() error {
+	t, err := tcGetAttr(0)
+	if err != nil {
+		return err
+	}
+	savedTermios = &termios{}
+	*savedTermios = *t
+
+	t.Lflag &^= icanon | echoF
+	t.Cc[vminI] = 1
+	t.Cc[vtimeI] = 0
+	return tcSetAttr(0, t)
+}
+
+func rawOff() {
+	if savedTermios != nil {
+		tcSetAttr(0, savedTermios)
+		savedTermios = nil
+	}
+}
+
+func readKey() byte {
+	buf := make([]byte, 3)
+	n, _ := syscall.Read(0, buf[:1])
+	if n != 1 {
+		return 0
+	}
+	ch := buf[0]
+	if ch == 27 {
+		n1, _ := syscall.Read(0, buf[:1])
+		n2, _ := syscall.Read(0, buf[1:2])
+		if n1 == 1 && n2 == 1 && buf[0] == '[' {
+			switch buf[1] {
+			case 'A':
+				return 'k'
+			case 'B':
+				return 'j'
+			case 'C':
+				return '>'
+			case 'D':
+				return '<'
+			}
+		}
+		return 27
+	}
+	return ch
+}
 
 // ============== Data Structures ==============
 
@@ -53,7 +136,6 @@ type ClaudeClient struct {
 	streaming        bool
 	cancelStream     chan bool
 	streamMutex      sync.RWMutex
-	mcpManager       *MCPManager
 }
 
 type ModelInfo struct {
@@ -201,7 +283,7 @@ func (c *ClaudeClient) fetchAvailableModels() ([]ModelInfo, error) {
 }
 
 func getModelDescription(modelID string) string {
-	if strings.Contains(modelID, "opus-4-5") || strings.Contains(modelID, "opus-4.5") {
+	if strings.Contains(modelID, "opus-4-6") || strings.Contains(modelID, "opus-4.6") {
 		return "Best for: multi-day projects, enterprise workflows, frontier intelligence"
 	} else if strings.Contains(modelID, "opus-4-1") || strings.Contains(modelID, "opus-4.1") {
 		return "Best for: AI agents, agentic search, expert coding"
@@ -230,8 +312,8 @@ func getFallbackModels() []ModelInfo {
 			Description: "Best for: everyday tasks with speed and cost balance",
 		},
 		{
-			ID:          "claude-opus-4-5-20251101",
-			DisplayName: "Claude Opus 4.5",
+			ID:          "claude-opus-4-6",
+			DisplayName: "Claude Opus 4.6",
 			Description: "Best for: multi-day projects, enterprise workflows, frontier intelligence",
 		},
 		{
@@ -456,7 +538,11 @@ func base64Decode(s string) string {
 }
 
 func generateDeviceID() string {
-	return uuid.New().String()
+	b := make([]byte, 16)
+	for i := range b {
+		b[i] = byte(time.Now().UnixNano() % 256)
+	}
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
 func getCookies() string {
@@ -495,15 +581,10 @@ func NewClaudeClient() *ClaudeClient {
 		deviceID:         generateDeviceID(),
 		sessionArtifacts: make(map[string][]Artifact),
 		cancelStream:     make(chan bool, 1),
-		mcpManager:       NewMCPManager(),
 	}
 	client.organizationID = client.getOrganizationID()
 
-	// Load MCP servers
 	fmt.Println()
-	if err := client.mcpManager.LoadConfig(); err != nil {
-		fmt.Printf("Warning: Failed to load MCP config: %v\n", err)
-	}
 
 	return client
 }
@@ -724,21 +805,14 @@ func (c *ClaudeClient) sendMessage(ctx context.Context, prompt, conversationID, 
 		parentUUID = conv.ChatMessages[len(conv.ChatMessages)-1].UUID
 	}
 
-	// Build tools list - only official Claude tools
 	tools := []map[string]interface{}{
 		{"type": "web_search_v0", "name": "web_search"},
 		{"type": "artifacts_v0", "name": "artifacts"},
 		{"type": "repl_v0", "name": "repl"},
 	}
 
-	// Inject MCP tools prompt if available
-	finalPrompt := prompt
-	if c.mcpManager.HasTools() {
-		finalPrompt = prompt + c.mcpManager.GetToolsPrompt()
-	}
-
 	reqBody := CompletionRequest{
-		Prompt:            finalPrompt,
+		Prompt:            prompt,
 		ParentMessageUUID: parentUUID,
 		Timezone:          "UTC",
 		PersonalizedStyles: []map[string]interface{}{
@@ -796,7 +870,6 @@ func (c *ClaudeClient) sendMessage(ctx context.Context, prompt, conversationID, 
 func (c *ClaudeClient) readStreamResponse(ctx context.Context, body io.ReadCloser) (string, bool, []Artifact, map[string][]EditOperation, bool) {
 	reader := bufio.NewReader(body)
 	var fullResponse strings.Builder
-	var displayBuffer strings.Builder // Buffer for detecting MCP tags before displaying
 	var currentEvent string
 	state := &StreamState{
 		CurrentArtifactInput: make(map[string]interface{}),
@@ -805,8 +878,6 @@ func (c *ClaudeClient) readStreamResponse(ctx context.Context, body io.ReadClose
 	contentBlocks := make(map[int]*ContentBlock)
 	needsContinuation := false
 	cancelled := false
-	inMCPTag := false
-	mcpTagBuffer := strings.Builder{}
 
 	for {
 		select {
@@ -853,53 +924,8 @@ func (c *ClaudeClient) readStreamResponse(ctx context.Context, body io.ReadClose
 			case "content_block_start":
 				c.handleContentBlockStart(jsonData, state, contentBlocks)
 			case "content_block_delta":
-				// Handle text delta with MCP tag detection
-				if delta, ok := jsonData["delta"].(map[string]interface{}); ok {
-					if deltaType, _ := delta["type"].(string); deltaType == "text_delta" {
-						if text, ok := delta["text"].(string); ok {
-							fullResponse.WriteString(text)
-
-							// Process character by character for MCP tag detection
-							for _, ch := range text {
-								if inMCPTag {
-									mcpTagBuffer.WriteRune(ch)
-									// Check if we've completed the closing tag
-									if strings.HasSuffix(mcpTagBuffer.String(), "</mcp_tool_call>") {
-										// Don't display the MCP tag content
-										inMCPTag = false
-										mcpTagBuffer.Reset()
-									}
-								} else {
-									displayBuffer.WriteRune(ch)
-									bufStr := displayBuffer.String()
-
-									// Check if we're starting an MCP tag
-									if strings.HasSuffix(bufStr, "<mcp_tool_call>") {
-										// Remove the tag from display buffer and start capturing
-										displayStr := bufStr[:len(bufStr)-len("<mcp_tool_call>")]
-										fmt.Print(displayStr)
-										displayBuffer.Reset()
-										inMCPTag = true
-										mcpTagBuffer.WriteString("<mcp_tool_call>")
-									} else if len(bufStr) > 20 && !strings.Contains(bufStr[len(bufStr)-20:], "<") {
-										// No potential tag start in last 20 chars, safe to flush
-										fmt.Print(bufStr)
-										displayBuffer.Reset()
-									}
-								}
-							}
-						}
-					} else {
-						// Handle other delta types normally
-						c.handleContentBlockDeltaNonText(jsonData, state, contentBlocks)
-					}
-				}
+				c.handleContentBlockDelta(jsonData, state, contentBlocks, &fullResponse)
 			case "content_block_stop":
-				// Flush any remaining display buffer
-				if displayBuffer.Len() > 0 {
-					fmt.Print(displayBuffer.String())
-					displayBuffer.Reset()
-				}
 				c.handleContentBlockStop(jsonData, state, contentBlocks)
 			case "message_delta":
 				if delta, ok := jsonData["delta"].(map[string]interface{}); ok {
@@ -909,11 +935,6 @@ func (c *ClaudeClient) readStreamResponse(ctx context.Context, body io.ReadClose
 				}
 			}
 		}
-	}
-
-	// Flush any remaining buffer
-	if displayBuffer.Len() > 0 {
-		fmt.Print(displayBuffer.String())
 	}
 
 	return fullResponse.String(), needsContinuation, state.CapturedArtifacts, state.EditedFiles, cancelled
@@ -930,11 +951,19 @@ func (c *ClaudeClient) handleContentBlockStart(jsonData map[string]interface{}, 
 	block := &ContentBlock{Type: blockType}
 
 	if blockType == "tool_use" {
-		state.InToolUse = true
 		toolName, _ := contentBlock["name"].(string)
 		toolID, _ := contentBlock["id"].(string)
 		block.Name = toolName
 		block.ID = toolID
+
+		// Skip present_files - it's UI-only, not relevant in terminal
+		if toolName == "present_files" {
+			state.InToolUse = false
+			blocks[index] = block
+			return
+		}
+
+		state.InToolUse = true
 		state.CurrentTool = toolName
 		state.CurrentToolID = toolID
 		state.ToolInput.Reset()
@@ -954,33 +983,14 @@ func (c *ClaudeClient) handleContentBlockStart(jsonData map[string]interface{}, 
 			fmt.Print("[running code] ")
 		case "view":
 			fmt.Print("[viewing file] ")
+		case "bash_tool":
+			fmt.Print("[running bash] ")
 		default:
 			fmt.Printf("[tool: %s] ", toolName)
 		}
 	}
 
 	blocks[index] = block
-}
-
-func (c *ClaudeClient) handleContentBlockDeltaNonText(jsonData map[string]interface{}, state *StreamState, blocks map[int]*ContentBlock) {
-	delta, ok := jsonData["delta"].(map[string]interface{})
-	if !ok {
-		return
-	}
-
-	deltaType, _ := delta["type"].(string)
-
-	switch deltaType {
-	case "input_json_delta":
-		if partialJSON, ok := delta["partial_json"].(string); ok {
-			state.ToolInput.WriteString(partialJSON)
-		}
-
-	case "tool_result_delta":
-		if content, ok := delta["content"].(string); ok {
-			state.ToolResultContent.WriteString(content)
-		}
-	}
 }
 
 func (c *ClaudeClient) handleContentBlockDelta(jsonData map[string]interface{}, state *StreamState, blocks map[int]*ContentBlock, fullResponse *strings.Builder) {
@@ -1097,233 +1107,155 @@ func (c *ClaudeClient) handleContentBlockStop(jsonData map[string]interface{}, s
 	}
 }
 
-// ============== Bubble Tea Selection Model ==============
+// ============== TUI ==============
 
-type selectionModel struct {
-	client        *ClaudeClient
-	conversations []ConversationResponse
-	cursor        int
-	currentPage   int
-	selected      *ConversationResponse
-	quit          bool
-	selectModel   bool
-	modelSelected string
+func cls() {
+	fmt.Print("\033[2J\033[H")
 }
 
-func initialSelectionModel(client *ClaudeClient, conversations []ConversationResponse) selectionModel {
-	return selectionModel{
-		client:        client,
-		conversations: conversations,
-		currentPage:   0,
+func pickConvo(convos []ConversationResponse) (int, *ConversationResponse) {
+	n := len(convos)
+	cur, pg := 0, 0
+	pgs := (n + pageSize - 1) / pageSize
+	if pgs < 1 {
+		pgs = 1
 	}
-}
 
-func (m selectionModel) totalPages() int {
-	if len(m.conversations) == 0 {
-		return 1
+	if err := rawOn(); err != nil {
+		fmt.Fprintln(os.Stderr, "raw mode failed:", err)
+		return -1, nil
 	}
-	return (len(m.conversations) + pageSize - 1) / pageSize
-}
+	defer rawOff()
 
-func (m selectionModel) getConversationsForPage() []ConversationResponse {
-	startIndex := m.currentPage * pageSize
-	endIndex := min(startIndex+pageSize, len(m.conversations))
-	if startIndex >= endIndex {
-		return []ConversationResponse{}
-	}
-	return m.conversations[startIndex:endIndex]
-}
+	for {
+		st := pg * pageSize
+		en := st + pageSize
+		if en > n {
+			en = n
+		}
+		cnt := en - st
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
+		cls()
+		fmt.Print("Select a Chat Session\n\n")
+		if cur == 0 {
+			fmt.Println("> Start New Chat")
+		} else {
+			fmt.Println("  Start New Chat")
+		}
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func (m selectionModel) Init() tea.Cmd { return nil }
-
-func (m selectionModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	convsOnPage := m.getConversationsForPage()
-	maxCursor := len(convsOnPage)
-	totalPages := m.totalPages()
-
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c", "q":
-			m.quit = true
-			return m, tea.Quit
-
-		case "up", "k":
-			if m.cursor > 0 {
-				m.cursor--
-			} else if m.currentPage > 0 {
-				m.currentPage--
-				m.cursor = len(m.getConversationsForPage())
+		for i := 0; i < cnt; i++ {
+			nm := convos[st+i].Name
+			if nm == "" {
+				nm = convos[st+i].Summary
 			}
-
-		case "down", "j":
-			if m.cursor < maxCursor {
-				m.cursor++
-			} else if m.currentPage < totalPages-1 {
-				m.currentPage++
-				m.cursor = 0
+			if nm == "" {
+				nm = "Untitled chat"
 			}
-
-		case "left", "<":
-			if m.currentPage > 0 {
-				m.currentPage--
-				m.cursor = 0
+			if len(nm) > 60 {
+				nm = nm[:60]
 			}
-
-		case "right", ">":
-			if m.currentPage < totalPages-1 {
-				m.currentPage++
-				m.cursor = 0
+			m := "  "
+			if cur == i+1 {
+				m = ">"
 			}
+			fmt.Printf("%s Continue: %s (%.8s)\n", m, nm, convos[st+i].UUID)
+		}
 
-		case "enter":
-			if m.cursor == 0 {
-				m.selected = nil
-				m.selectModel = true
-			} else {
-				startIndex := m.currentPage * pageSize
-				actualIndex := startIndex + (m.cursor - 1)
-				if actualIndex < len(m.conversations) {
-					m.selected = &m.conversations[actualIndex]
+		if n > pageSize {
+			fmt.Printf("\nPage %d/%d (%d total)\n(j/k:move enter:select q:quit </>:page)\n", pg+1, pgs, n)
+		} else {
+			fmt.Println("\n(j/k:move enter:select q:quit)")
+		}
+
+		ch := readKey()
+		switch ch {
+		case 'q':
+			return -1, nil
+		case 'k':
+			if cur > 0 {
+				cur--
+			} else if pg > 0 {
+				pg--
+				newEn := pg*pageSize + pageSize
+				if newEn > n {
+					newEn = n
 				}
+				cur = newEn - pg*pageSize
 			}
-			return m, tea.Quit
+		case 'j':
+			if cur < cnt {
+				cur++
+			} else if pg < pgs-1 {
+				pg++
+				cur = 0
+			}
+		case '<':
+			if pg > 0 {
+				pg--
+				cur = 0
+			}
+		case '>':
+			if pg < pgs-1 {
+				pg++
+				cur = 0
+			}
+		case '\r', '\n':
+			if cur == 0 {
+				return 0, nil
+			}
+			idx := pg*pageSize + (cur - 1)
+			if idx < n {
+				return 1, &convos[idx]
+			}
 		}
 	}
-	return m, nil
 }
 
-func (m selectionModel) View() string {
-	var b strings.Builder
-	b.WriteString("Select a Chat Session\n\n")
-
-	if m.cursor == 0 {
-		b.WriteString("> Start New Chat\n")
-	} else {
-		b.WriteString("  Start New Chat\n")
-	}
-
-	convsToDisplay := m.getConversationsForPage()
-	for i, conv := range convsToDisplay {
-		cursor := "  "
-		if m.cursor == i+1 {
-			cursor = "> "
-		}
-
-		name := conv.Name
-		if name == "" {
-			name = conv.Summary
-		}
-		if name == "" {
-			name = "Untitled chat"
-		}
-
-		line := fmt.Sprintf("%sContinue: %s (%s)\n", cursor, name, conv.UUID[:8])
-		b.WriteString(line)
-	}
-
-	totalConvs := len(m.conversations)
-	totalPages := m.totalPages()
-
-	if totalConvs > pageSize || totalConvs == 0 {
-		b.WriteString(fmt.Sprintf("\nPage %d of %d (total conversations: %d)\n", m.currentPage+1, totalPages, totalConvs))
-		b.WriteString("(j/k: move, enter: select, q: quit, </left, >/right: page nav)\n")
-	} else {
-		b.WriteString("\n(j/k: move, enter: select, q: quit)\n")
-	}
-	return b.String()
-}
-
-// ============== Model Selection ==============
-
-type modelSelectionModel struct {
-	models   []ModelInfo
-	cursor   int
-	selected string
-	quit     bool
-	loading  bool
-	errMsg   string
-}
-
-func initialModelSelectionModel(client *ClaudeClient) modelSelectionModel {
+func pickModel(client *ClaudeClient) (string, bool) {
 	models, err := client.fetchAvailableModels()
 	if err != nil {
 		models = getFallbackModels()
 	}
 
-	return modelSelectionModel{
-		models:  models,
-		cursor:  0,
-		loading: false,
+	n := len(models)
+	cur := 0
+
+	if err := rawOn(); err != nil {
+		return "", false
 	}
-}
+	defer rawOff()
 
-func (m modelSelectionModel) Init() tea.Cmd { return nil }
-
-func (m modelSelectionModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c", "q":
-			m.quit = true
-			return m, tea.Quit
-
-		case "up", "k":
-			if m.cursor > 0 {
-				m.cursor--
+	for {
+		cls()
+		fmt.Print("Select Claude Model\n\n")
+		for i := 0; i < n; i++ {
+			m := "  "
+			if cur == i {
+				m = ">"
 			}
-
-		case "down", "j":
-			if m.cursor < len(m.models)-1 {
-				m.cursor++
+			fmt.Printf("%s %s\n   %s\n", m, models[i].DisplayName, models[i].Description)
+			if i < n-1 {
+				fmt.Println()
 			}
+		}
+		fmt.Println("\n(j/k:move enter:select q:quit)")
 
-		case "enter":
-			m.selected = m.models[m.cursor].ID
-			return m, tea.Quit
+		ch := readKey()
+		switch ch {
+		case 'q':
+			return "", false
+		case 'k':
+			if cur > 0 {
+				cur--
+			}
+		case 'j':
+			if cur < n-1 {
+				cur++
+			}
+		case '\r', '\n':
+			return models[cur].ID, true
 		}
 	}
-	return m, nil
-}
-
-func (m modelSelectionModel) View() string {
-	var b strings.Builder
-	b.WriteString("Select Claude Model\n")
-
-	if m.errMsg != "" {
-		b.WriteString(fmt.Sprintf("(Using fallback list - API fetch failed)\n"))
-	}
-	b.WriteString("\n")
-
-	for i, model := range m.models {
-		cursor := "  "
-		if m.cursor == i {
-			cursor = "> "
-		}
-
-		b.WriteString(fmt.Sprintf("%s%s\n", cursor, model.DisplayName))
-		b.WriteString(fmt.Sprintf("   %s\n", model.Description))
-		if i < len(m.models)-1 {
-			b.WriteString("\n")
-		}
-	}
-
-	b.WriteString("\n(j/k: move, enter: select, q: quit)\n")
-	return b.String()
 }
 
 // ============== Simple CLI Chat ==============
@@ -1360,7 +1292,6 @@ func runSimpleChat(client *ClaudeClient, conversationID string, isNew bool, mode
 		fmt.Printf("%s%s%s\n", colorClaude, separator, colorReset)
 	}
 
-	// Display selected model
 	var modelDisplayName string
 	for _, m := range getFallbackModels() {
 		if m.ID == modelID {
@@ -1373,14 +1304,8 @@ func runSimpleChat(client *ClaudeClient, conversationID string, isNew bool, mode
 	}
 	fmt.Printf("Using model: %s\n", modelDisplayName)
 
-	// Show MCP tools if available
-	if client.mcpManager.HasTools() {
-		tools := client.mcpManager.GetAllTools()
-		fmt.Printf("MCP tools available: %d (use !mcp to list)\n", len(tools))
-	}
-
 	fmt.Println("Type your message, then '.' on a new line to send.")
-	fmt.Println("Commands: !exit, !files, !mcp")
+	fmt.Println("Commands: !exit, !files")
 	fmt.Println("Press ESC during streaming to cancel the response.")
 
 	scanner := bufio.NewScanner(os.Stdin)
@@ -1403,31 +1328,6 @@ func runSimpleChat(client *ClaudeClient, conversationID string, isNew bool, mode
 				if trimmed == "!exit" {
 					fmt.Printf("%s%s%s\n", colorUser, separator, colorReset)
 					return true
-				}
-
-				if trimmed == "!mcp" {
-					fmt.Printf("%s%s%s\n", colorUser, separator, colorReset)
-					tools := client.mcpManager.GetAllTools()
-					if len(tools) == 0 {
-						fmt.Println("No MCP tools loaded.")
-						fmt.Printf("Add servers to %s\n", getPath("mcp.json"))
-						fmt.Println("\nExample config:")
-						fmt.Println(`{
-  "mcpServers": {
-    "zig-docs": {
-      "command": "npx",
-      "args": ["-y", "zig-mcp@latest"]
-    }
-  }
-}`)
-					} else {
-						fmt.Printf("=== MCP Tools (%d) ===\n\n", len(tools))
-						for _, tool := range tools {
-							fmt.Printf("%s• %s%s [%s]\n", colorMCP, tool.Name, colorReset, tool.ServerName)
-							fmt.Printf("  %s\n\n", tool.Description)
-						}
-					}
-					continue
 				}
 
 				if trimmed == "!files" {
@@ -1570,250 +1470,200 @@ func runSimpleChat(client *ClaudeClient, conversationID string, isNew bool, mode
 		}
 
 		fmt.Printf("%s%s%s\n\n", colorUser, separator, colorReset)
+		fmt.Printf("%s%s%s\n", colorClaude, separator, colorReset)
+		fmt.Printf("%sClaude:%s ", colorClaude, colorReset)
 
-		// MCP tool call loop
-		currentPrompt := userInput
-		mcpContext := ""
+		select {
+		case <-client.cancelStream:
+		default:
+		}
 
-		for {
-			fmt.Printf("%s%s%s\n", colorClaude, separator, colorReset)
-			fmt.Printf("%sClaude:%s ", colorClaude, colorReset)
+		ctx, cancel := context.WithCancel(context.Background())
 
-			select {
-			case <-client.cancelStream:
-			default:
+		// ESC handler goroutine
+		go func() {
+			origTermios, termErr := tcGetAttr(0)
+			if termErr != nil {
+				return
 			}
 
-			ctx, cancel := context.WithCancel(context.Background())
-			keyboardDone := make(chan bool)
+			raw := *origTermios
+			raw.Lflag &^= icanon | echoF
+			raw.Cc[vminI] = 1
+			raw.Cc[vtimeI] = 0
+			tcSetAttr(0, &raw)
 
-			go func() {
-				defer close(keyboardDone)
-
-				time.Sleep(100 * time.Millisecond)
-
-				if err := keyboard.Open(); err != nil {
-					return
-				}
-				defer keyboard.Close()
-
-				keyEvents := make(chan keyboard.Key, 10)
-				go func() {
-					for {
-						_, key, err := keyboard.GetKey()
-						if err != nil {
-							close(keyEvents)
-							return
-						}
-						keyEvents <- key
-					}
-				}()
-
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case key, ok := <-keyEvents:
-						if !ok {
-							return
-						}
-
-						if key == keyboard.KeyEsc {
-							if client.isStreaming() {
-								go client.stopResponse(conversationID)
-
-								select {
-								case client.cancelStream <- true:
-								default:
-								}
-								cancel()
-								return
-							}
-						}
-					}
-				}
+			defer func() {
+				tcSetAttr(0, origTermios)
 			}()
 
-			// Build prompt with MCP context if we have tool results
-			promptToSend := currentPrompt
-			if mcpContext != "" {
-				promptToSend = currentPrompt + "\n\n" + mcpContext
+			buf := make([]byte, 1)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				if !client.isStreaming() {
+					return
+				}
+
+				n, _ := syscall.Read(0, buf)
+				if n == 1 && buf[0] == 27 {
+					if client.isStreaming() {
+						go client.stopResponse(conversationID)
+						select {
+						case client.cancelStream <- true:
+						default:
+						}
+						cancel()
+						return
+					}
+				}
 			}
+		}()
 
-			response, _, artifacts, editedFiles, cancelled := client.sendMessage(ctx, promptToSend, conversationID, modelID)
+		response, _, artifacts, editedFiles, cancelled := client.sendMessage(ctx, userInput, conversationID, modelID)
 
-			cancel()
-			<-keyboardDone
+		cancel()
 
-			if cancelled {
-				fmt.Printf("\n\n[Stream cancelled by user]\n")
-				fmt.Printf("%s%s%s\n\n", colorClaude, separator, colorReset)
-				break
+		if cancelled {
+			fmt.Printf("\n\n[Stream cancelled by user]\n")
+			fmt.Printf("%s%s%s\n\n", colorClaude, separator, colorReset)
+			continue
+		}
+
+		fmt.Printf("\n%s%s%s\n\n", colorClaude, separator, colorReset)
+
+		if len(artifacts) > 0 {
+			client.sessionArtifacts[conversationID] = append(client.sessionArtifacts[conversationID], artifacts...)
+			appendArtifacts(conversationID, artifacts)
+
+			for _, art := range artifacts {
+				if art.Content != "" && (art.Type == "file" || art.Type == "artifact") {
+					fmt.Printf("\n[artifact] %s\n", art.Title)
+					lang := art.Language
+					if lang == "" {
+						lang = "text"
+					}
+					fmt.Printf("```%s\n", lang)
+					fmt.Print(art.Content)
+					if !strings.HasSuffix(art.Content, "\n") {
+						fmt.Println()
+					}
+					fmt.Printf("```\n\n")
+				}
 			}
+		}
 
-			fmt.Printf("\n%s%s%s\n\n", colorClaude, separator, colorReset)
+		if len(editedFiles) > 0 {
+			editedFilePaths := make([]string, 0, len(editedFiles))
+			for filePath := range editedFiles {
+				editedFilePaths = append(editedFilePaths, filePath)
+			}
+			sort.Strings(editedFilePaths)
 
-			// Check for MCP tool calls in the response
-			toolCalls := ParseMCPToolCalls(response)
+			fmt.Printf("\n[edited %d file(s)] ", len(editedFilePaths))
+			for i, path := range editedFilePaths {
+				if i > 0 {
+					fmt.Print(", ")
+				}
+				fmt.Print(filepath.Base(path))
+			}
+			fmt.Println()
 
-			if len(toolCalls) > 0 && client.mcpManager.HasTools() {
-				// Execute MCP tool calls
-				var toolResults strings.Builder
-				toolResults.WriteString("MCP Tool Results:\n")
+			time.Sleep(500 * time.Millisecond)
 
-				for _, call := range toolCalls {
-					fmt.Printf("%s[MCP: calling %s]%s ", colorMCP, call.Tool, colorReset)
+			fmt.Println("Fetching updated files from server...")
+			remoteFiles, err := client.listRemoteFiles(conversationID)
+			if err != nil {
+				fmt.Printf("Warning: Could not fetch remote files: %v\n", err)
+			} else {
+				remoteFileMap := make(map[string]Artifact)
+				for _, rf := range remoteFiles {
+					baseName := filepath.Base(rf.FileName)
+					remoteFileMap[baseName] = rf
+				}
 
-					result, err := client.mcpManager.CallTool(call.Tool, call.Arguments)
-					if err != nil {
-						fmt.Printf("error: %v\n", err)
-						toolResults.WriteString(fmt.Sprintf("\n<tool_result name=\"%s\" error=\"true\">\n%s\n</tool_result>\n", call.Tool, err.Error()))
+				if len(editedFilePaths) == 1 {
+					filePath := editedFilePaths[0]
+					baseName := filepath.Base(filePath)
+
+					if remoteArt, exists := remoteFileMap[baseName]; exists {
+						content, err := client.downloadRemoteFile(conversationID, remoteArt.FileName)
+						if err != nil {
+							fmt.Printf("Warning: Could not download %s: %v\n", baseName, err)
+						} else {
+							fmt.Printf("\n=== Updated: %s ===\n\n", baseName)
+							lang := remoteArt.Language
+							if lang == "" {
+								lang = "text"
+							}
+							fmt.Printf("```%s\n", lang)
+							fmt.Print(content)
+							if !strings.HasSuffix(content, "\n") {
+								fmt.Println()
+							}
+							fmt.Printf("```\n\n")
+						}
 					} else {
-						fmt.Printf("done\n")
-						// Truncate very long results for display
-						displayResult := result
-						if len(displayResult) > 500 {
-							displayResult = displayResult[:500] + "... [truncated]"
-						}
-						toolResults.WriteString(fmt.Sprintf("\n<tool_result name=\"%s\">\n%s\n</tool_result>\n", call.Tool, result))
+						fmt.Printf("Warning: %s not found in remote files\n", baseName)
 					}
-				}
-
-				// Continue the conversation with tool results
-				mcpContext = toolResults.String()
-				currentPrompt = "Here are the results from the MCP tools you called. Please continue your response using this information:"
-				continue
-			}
-
-			// No more tool calls, we're done
-			if len(artifacts) > 0 {
-				client.sessionArtifacts[conversationID] = append(client.sessionArtifacts[conversationID], artifacts...)
-				appendArtifacts(conversationID, artifacts)
-
-				for _, art := range artifacts {
-					if art.Content != "" && (art.Type == "file" || art.Type == "artifact") {
-						fmt.Printf("\n[artifact] %s\n", art.Title)
-						lang := art.Language
-						if lang == "" {
-							lang = "text"
-						}
-						fmt.Printf("```%s\n", lang)
-						fmt.Print(art.Content)
-						if !strings.HasSuffix(art.Content, "\n") {
-							fmt.Println()
-						}
-						fmt.Printf("```\n\n")
-					}
-				}
-			}
-
-			if len(editedFiles) > 0 {
-				editedFilePaths := make([]string, 0, len(editedFiles))
-				for filePath := range editedFiles {
-					editedFilePaths = append(editedFilePaths, filePath)
-				}
-				sort.Strings(editedFilePaths)
-
-				fmt.Printf("\n[edited %d file(s)] ", len(editedFilePaths))
-				for i, path := range editedFilePaths {
-					if i > 0 {
-						fmt.Print(", ")
-					}
-					fmt.Print(filepath.Base(path))
-				}
-				fmt.Println()
-
-				time.Sleep(500 * time.Millisecond)
-
-				fmt.Println("Fetching updated files from server...")
-				remoteFiles, err := client.listRemoteFiles(conversationID)
-				if err != nil {
-					fmt.Printf("Warning: Could not fetch remote files: %v\n", err)
 				} else {
-					remoteFileMap := make(map[string]Artifact)
-					for _, rf := range remoteFiles {
-						baseName := filepath.Base(rf.FileName)
-						remoteFileMap[baseName] = rf
+					fmt.Println("\nMultiple files were edited. Which would you like to view?")
+					for i, path := range editedFilePaths {
+						baseName := filepath.Base(path)
+						fmt.Printf("  [%d] %s\n", i+1, baseName)
+					}
+					fmt.Printf("  [a] View all\n")
+					fmt.Printf("  [n] Skip viewing (files are saved)\n")
+
+					reader := bufio.NewReader(os.Stdin)
+					fmt.Print("\nChoice: ")
+					choice, _ := reader.ReadString('\n')
+					choice = strings.TrimSpace(strings.ToLower(choice))
+
+					filesToShow := []string{}
+					if choice == "a" || choice == "all" {
+						filesToShow = editedFilePaths
+					} else if choice == "n" || choice == "" {
+						fmt.Println()
+					} else if choiceNum, err := strconv.Atoi(choice); err == nil && choiceNum >= 1 && choiceNum <= len(editedFilePaths) {
+						filesToShow = []string{editedFilePaths[choiceNum-1]}
 					}
 
-					if len(editedFilePaths) == 1 {
-						filePath := editedFilePaths[0]
+					for _, filePath := range filesToShow {
 						baseName := filepath.Base(filePath)
 
 						if remoteArt, exists := remoteFileMap[baseName]; exists {
 							content, err := client.downloadRemoteFile(conversationID, remoteArt.FileName)
 							if err != nil {
 								fmt.Printf("Warning: Could not download %s: %v\n", baseName, err)
-							} else {
-								fmt.Printf("\n=== Updated: %s ===\n\n", baseName)
-								lang := remoteArt.Language
-								if lang == "" {
-									lang = "text"
-								}
-								fmt.Printf("```%s\n", lang)
-								fmt.Print(content)
-								if !strings.HasSuffix(content, "\n") {
-									fmt.Println()
-								}
-								fmt.Printf("```\n\n")
+								continue
 							}
+
+							fmt.Printf("\n=== Updated: %s ===\n\n", baseName)
+							lang := remoteArt.Language
+							if lang == "" {
+								lang = "text"
+							}
+							fmt.Printf("```%s\n", lang)
+							fmt.Print(content)
+							if !strings.HasSuffix(content, "\n") {
+								fmt.Println()
+							}
+							fmt.Printf("```\n\n")
 						} else {
 							fmt.Printf("Warning: %s not found in remote files\n", baseName)
-						}
-					} else {
-						fmt.Println("\nMultiple files were edited. Which would you like to view?")
-						for i, path := range editedFilePaths {
-							baseName := filepath.Base(path)
-							fmt.Printf("  [%d] %s\n", i+1, baseName)
-						}
-						fmt.Printf("  [a] View all\n")
-						fmt.Printf("  [n] Skip viewing (files are saved)\n")
-
-						reader := bufio.NewReader(os.Stdin)
-						fmt.Print("\nChoice: ")
-						choice, _ := reader.ReadString('\n')
-						choice = strings.TrimSpace(strings.ToLower(choice))
-
-						filesToShow := []string{}
-						if choice == "a" || choice == "all" {
-							filesToShow = editedFilePaths
-						} else if choice == "n" || choice == "" {
-							fmt.Println()
-						} else if choiceNum, err := strconv.Atoi(choice); err == nil && choiceNum >= 1 && choiceNum <= len(editedFilePaths) {
-							filesToShow = []string{editedFilePaths[choiceNum-1]}
-						}
-
-						for _, filePath := range filesToShow {
-							baseName := filepath.Base(filePath)
-
-							if remoteArt, exists := remoteFileMap[baseName]; exists {
-								content, err := client.downloadRemoteFile(conversationID, remoteArt.FileName)
-								if err != nil {
-									fmt.Printf("Warning: Could not download %s: %v\n", baseName, err)
-									continue
-								}
-
-								fmt.Printf("\n=== Updated: %s ===\n\n", baseName)
-								lang := remoteArt.Language
-								if lang == "" {
-									lang = "text"
-								}
-								fmt.Printf("```%s\n", lang)
-								fmt.Print(content)
-								if !strings.HasSuffix(content, "\n") {
-									fmt.Println()
-								}
-								fmt.Printf("```\n\n")
-							} else {
-								fmt.Printf("Warning: %s not found in remote files\n", baseName)
-							}
 						}
 					}
 				}
 			}
-
-			break // Exit the MCP tool loop
 		}
+
+		// Suppress response variable
+		_ = response
 
 		if isFirstMessage {
 			isFirstMessage = false
@@ -1829,25 +1679,14 @@ func runSimpleChat(client *ClaudeClient, conversationID string, isNew bool, mode
 func main() {
 	client := NewClaudeClient()
 
-	fmt.Println("Claude Terminal Client")
+	fmt.Println("Claude Terminal Client (gogpt)")
 	fmt.Println()
 
 	for {
 		conversations := client.getConversations()
 
-		p := tea.NewProgram(initialSelectionModel(client, conversations))
-		m, err := p.Run()
-		if err != nil {
-			log.Fatalf("Error running selection UI: %v", err)
-		}
-
-		finalModel, ok := m.(selectionModel)
-		if !ok {
-			log.Fatalf("Could not determine final selection model.")
-		}
-
-		if finalModel.quit {
-			client.mcpManager.Close()
+		choice, sel := pickConvo(conversations)
+		if choice < 0 {
 			fmt.Println("Goodbye!")
 			return
 		}
@@ -1856,32 +1695,17 @@ func main() {
 		var isNew bool
 		var selectedModel string
 
-		if finalModel.selected == nil {
-			if finalModel.selectModel {
-				mp := tea.NewProgram(initialModelSelectionModel(client))
-				mm, err := mp.Run()
-				if err != nil {
-					log.Fatalf("Error running model selection UI: %v", err)
-				}
-
-				modelModel, ok := mm.(modelSelectionModel)
-				if !ok {
-					log.Fatalf("Could not determine model selection.")
-				}
-
-				if modelModel.quit {
-					client.mcpManager.Close()
-					fmt.Println("Goodbye!")
-					return
-				}
-
-				selectedModel = modelModel.selected
+		if choice == 0 {
+			mid, ok := pickModel(client)
+			if !ok {
+				fmt.Println("Goodbye!")
+				return
 			}
-
+			selectedModel = mid
 			conversationID = client.createNewChat()
 			isNew = true
 		} else {
-			conversationID = finalModel.selected.UUID
+			conversationID = sel.UUID
 			isNew = false
 			selectedModel = "claude-sonnet-4-5-20250929"
 		}
@@ -1892,7 +1716,6 @@ func main() {
 
 		continueLoop := runSimpleChat(client, conversationID, isNew, selectedModel)
 		if !continueLoop {
-			client.mcpManager.Close()
 			fmt.Println("Goodbye!")
 			return
 		}
